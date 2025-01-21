@@ -1,0 +1,501 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+#
+
+import os
+
+import torch.distributed
+
+# -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
+try:
+    # -- WARNING: IF DOING DISTRIBUTED TRAINING ON A NON-SLURM CLUSTER, MAKE
+    # --          SURE TO UPDATE THIS TO GET LOCAL-RANK ON NODE, OR ENSURE
+    # --          THAT YOUR JOBS ARE LAUNCHED WITH ONLY 1 DEVICE VISIBLE
+    # --          TO EACH PROCESS
+    os.environ['CUDA_VISIBLE_DEVICES'] = os.environ['SLURM_LOCALID']
+except Exception:
+    pass
+
+import copy
+import logging
+import sys
+import yaml
+
+import numpy as np
+
+import torch
+import torch.multiprocessing as mp
+import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel
+
+from src.masks.multiblock import MaskCollator as MBMaskCollator
+from src.utils.distributed import (
+    init_distributed,
+    AllReduce
+)
+from src.utils.logging import (
+    CSVLogger,
+    WANDBLogger,
+    gpu_timer,
+    grad_logger,
+    adamw_logger,
+    AverageMeter)
+from src.utils.tensors import (
+    repeat_interleave_batch, 
+    apply_masks
+)
+from src.datasets.ecgnet import make_ecgnet
+
+from src.utils.helper import (
+    init_local_config)
+from ssls.jepa.helper import (
+    load_checkpoint,
+    init_model,
+    init_opt,
+)
+from src.transforms import make_group_transforms as make_transforms
+
+# --
+log_timings = True
+log_freq = 10
+checkpoint_freq = 50
+# --
+
+_GLOBAL_SEED = 0
+np.random.seed(_GLOBAL_SEED)
+torch.manual_seed(_GLOBAL_SEED)
+torch.backends.cudnn.benchmark = True
+
+logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+logger = logging.getLogger()
+
+
+def main(args, resume_preempt=False):
+
+    # ----------------------------------------------------------------------- #
+    #  PASSED IN PARAMS FROM CONFIG FILE
+    # ----------------------------------------------------------------------- #
+
+    # -- META
+    use_bfloat16 = args['meta']['use_bfloat16']
+    model_name = args['meta']['model_name']
+    predictor_name = args['meta']['predictor_name']
+    load_model = args['meta']['load_checkpoint'] or resume_preempt
+    r_file = args['meta']['read_checkpoint']
+    #copy_data = args['meta']['copy_data']
+    pred_depth = args['meta']['pred_depth']
+    pred_emb_dim = args['meta']['pred_emb_dim']
+    if not torch.cuda.is_available():
+        device = torch.device('cpu')
+    else:
+        device = torch.device('cuda')
+        torch.cuda.device(device)
+
+    # -- DATA
+    use_gaussian_blur = args['data']['use_gaussian_blur']
+    use_horizontal_flip = args['data']['use_horizontal_flip']
+    use_color_distortion = args['data']['use_color_distortion']
+    color_jitter = args['data']['color_jitter_strength']
+    use_grayscale = True if args['data']['in_chans'] == 1 else False
+    # --
+    batch_size = args['data']['batch_size']
+    pin_mem = args['data']['pin_mem']
+    num_workers = args['data']['num_workers']
+    #root_path = args['data']['root_path']
+    #image_folder = args['data']['image_folder']
+    clean = args['data']['clean']
+    crop_size = args['data']['crop_size']
+    crop_scale = args['data']['crop_scale']
+    in_chans = args['data']['in_chans']
+    x_label = args['data']['x_label']
+    train_data_kwargs = {
+        "x_label": x_label, 
+        "clean": clean, 
+        "crop_size": crop_size, 
+        "crop_scale": crop_scale, 
+        "gaussian_blur": use_gaussian_blur,
+        "horizontal_flip": use_horizontal_flip,
+        "color_distortion":use_color_distortion,
+        "gray_scale": use_grayscale,
+        "color_jitter": color_jitter,
+    }
+    train_config = init_local_config(args['data']['train'], **train_data_kwargs)
+    is_1d = x_label == "ecg"
+    assert x_label == "ecg" or x_label == "img", f"x_label should be in [ecg|img] not {x_label}"
+    # --
+
+    # -- MASK
+    allow_overlap = args['mask']['allow_overlap']  # whether to allow overlap b/w context and target blocks
+    patch_size = args['mask']['patch_size']  # patch-size for model training
+    num_enc_masks = args['mask']['num_enc_masks']  # number of context blocks
+    min_keep = args['mask']['min_keep']  # min number of patches in context block
+    enc_mask_scale = args['mask']['enc_mask_scale']  # scale of context blocks
+    num_pred_masks = args['mask']['num_pred_masks']  # number of target blocks
+    pred_mask_scale = args['mask']['pred_mask_scale']  # scale of target blocks
+    aspect_ratio = args['mask']['aspect_ratio']  # aspect ratio of target blocks
+    # --
+
+    # -- LOSS
+    cfgs_loss = args.get('loss', {})
+    loss_exp = cfgs_loss.get('loss_exp', 0)
+    reg_coeff = cfgs_loss.get('reg_coeff', 0)
+
+
+    # -- OPTIMIZATION
+    ema = args['optimization']['ema']
+    ipe_scale = args['optimization']['ipe_scale']  # scheduler scale factor (def: 1.0)
+    clip_grad = args['optimization'].get('clip_grad', None)
+    wd = float(args['optimization']['weight_decay'])
+    final_wd = float(args['optimization']['final_weight_decay'])
+    num_epochs = args['optimization']['epochs']
+    warmup = args['optimization']['warmup']
+    start_lr = args['optimization']['start_lr']
+    lr = args['optimization']['lr']
+    final_lr = args['optimization']['final_lr']
+
+    # -- LOGGING
+    folder = args['logging']['folder']
+    if not os.path.exists(folder):
+        os.makedirs(folder, exist_ok=True)
+    tag = args['logging']['write_tag']
+    wandb_login =args['logging'].get('wandb_login', False)
+    exp_project=args['logging']['project'] 
+    exp_name=args['logging']['name'] 
+    exp_id = args['logging'].get('run_id', None)
+
+
+    dump = os.path.join(folder, 'params-ijepa.yaml')
+    with open(dump, 'w') as f:
+        yaml.dump(args, f)
+    # ----------------------------------------------------------------------- #
+
+    try:
+        mp.set_start_method('spawn')
+    except Exception:
+        pass
+
+    # -- init torch distributed backend
+    world_size, rank = init_distributed()
+    logger.info(f'Initialized (rank/world-size) {rank}/{world_size}')
+    if rank > 0:
+        logger.setLevel(logging.ERROR)
+
+    # -- log/checkpointing paths
+    log_file = os.path.join(folder, f'{tag}_r{rank}.csv')
+    save_path = os.path.join(folder, f'{tag}' + '-ep{epoch}.pth.tar')
+    latest_path = os.path.join(folder, f'{tag}-latest.pth.tar')
+    load_path = None
+    if load_model:
+        load_path = os.path.join(folder, r_file) if r_file is not None else latest_path
+
+    # -- make csv_logger
+    csv_logger = CSVLogger(log_file,
+                           ('%d', 'epoch'),
+                           ('%d', 'itr'),
+                           ('%.5f', 'loss'),
+                           ('%.5f', 'mask-A'),
+                           ('%.5f', 'mask-B'),
+                           ('%d', 'time (ms)'))
+    
+    wandb_logger = WANDBLogger(
+        login=wandb_login,
+        dir=os.path.join(folder),
+        project=exp_project, 
+        name=exp_name, 
+        id=exp_id)
+    
+    def log_csv_wandb(epoch, itr, loss, maskA_len, maskB_len, etime):
+        csv_logger.log(epoch, itr, loss, maskA_len, maskB_len, etime)
+        wandb_logger.log({
+            "epoch": epoch,
+            "itr": itr,
+            "loss": loss,
+            "maskA_len": maskA_len,
+            "maskB_len": maskB_len,
+            "etime": etime
+        })
+
+
+    # -- init model
+    encoder, predictor = init_model(
+        device=device,
+        patch_size=patch_size,
+        crop_size=crop_size,
+        pred_depth=pred_depth,
+        pred_emb_dim=pred_emb_dim,
+        in_chans=in_chans,
+        model_name=model_name,
+        predictor_name=predictor_name,
+        learnable_mask=True,
+        )
+    target_encoder = copy.deepcopy(encoder)
+
+    # -- make data transforms
+    mask_collator = MBMaskCollator(
+        input_size=crop_size,
+        patch_size=patch_size,
+        pred_mask_scale=pred_mask_scale,
+        enc_mask_scale=enc_mask_scale,
+        aspect_ratio=aspect_ratio,
+        num_enc_masks=num_enc_masks,
+        num_pred_masks=num_pred_masks,
+        allow_overlap=allow_overlap,
+        is_1d=is_1d,
+        min_keep=min_keep)
+
+    transform = make_transforms(x_label, train_config,)
+
+    # -- init data-loaders/samplers
+    # _, unsupervised_loader, unsupervised_sampler = make_imagenet1k(
+    _, unsupervised_loader, unsupervised_sampler = make_ecgnet(
+        transform=transform,
+        batch_size=batch_size,
+        collator=mask_collator,
+        pin_mem=pin_mem,
+        config=train_config,
+        num_workers=num_workers,
+        world_size=world_size,
+        rank=rank,
+    )
+    ipe = len(unsupervised_loader)
+
+    # -- init optimizer and scheduler
+    optimizer, scaler, scheduler, wd_scheduler = init_opt(
+        encoder=encoder,
+        predictor=predictor,
+        wd=wd,
+        final_wd=final_wd,
+        start_lr=start_lr,
+        ref_lr=lr,
+        final_lr=final_lr,
+        iterations_per_epoch=ipe,
+        warmup=warmup,
+        num_epochs=num_epochs,
+        ipe_scale=ipe_scale,
+        use_bfloat16=use_bfloat16)
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        encoder = DistributedDataParallel(encoder, static_graph=True)
+        predictor = DistributedDataParallel(predictor, static_graph=True)
+        target_encoder = DistributedDataParallel(target_encoder)
+    for p in target_encoder.parameters():
+        p.requires_grad = False
+
+    # -- momentum schedule
+    momentum_scheduler = (ema[0] + i*(ema[1]-ema[0])/(ipe*num_epochs*ipe_scale)
+                          for i in range(int(ipe*num_epochs*ipe_scale)+1))
+
+    start_epoch = 0
+    # -- load training checkpoint
+    if load_model:
+        encoder, predictor, target_encoder, optimizer, scaler, start_epoch = load_checkpoint(
+            device=device,
+            r_path=load_path,
+            encoder=encoder,
+            predictor=predictor,
+            target_encoder=target_encoder,
+            opt=optimizer,
+            scaler=scaler)
+        for _ in range(start_epoch*ipe):
+            scheduler.step()
+            wd_scheduler.step()
+            next(momentum_scheduler)
+            mask_collator.step()
+
+    def save_checkpoint(epoch):
+        save_dict = {
+            'encoder': encoder.state_dict(),
+            'predictor': predictor.state_dict(),
+            'target_encoder': target_encoder.state_dict(),
+            'opt': optimizer.state_dict(),
+            'scaler': None if scaler is None else scaler.state_dict(),
+            'epoch': epoch,
+            'loss': loss_meter.avg,
+            'loss_jepa': loss_jepa_meter.avg,
+            'loss_reg': loss_reg_meter.avg,
+            'batch_size': batch_size,
+            'world_size': world_size,
+            'lr': lr
+        }
+        if rank == 0:
+            torch.save(save_dict, latest_path)
+            if (epoch + 1) % checkpoint_freq == 0:
+                torch.save(save_dict, save_path.format(epoch=f'{epoch + 1}'))
+
+    # -- TRAINING LOOP
+    for epoch in range(start_epoch, num_epochs):
+        logger.info('Epoch %d' % (epoch + 1))
+        # -- update distributed-data-loader epoch
+        unsupervised_sampler.set_epoch(epoch)
+
+        loss_meter = AverageMeter()
+        loss_jepa_meter = AverageMeter()
+        loss_reg_meter = AverageMeter()
+        maskA_meter = AverageMeter()
+        maskB_meter = AverageMeter()
+        time_meter = AverageMeter()
+
+        for itr, (udata, masks_enc, masks_pred) in enumerate(unsupervised_loader):
+            def load_inputs():
+                # -- unsupervised data
+                x = udata[x_label].to(device, non_blocking=True)
+                masks_1 = [u.to(device, non_blocking=True) for u in masks_enc]
+                masks_2 = [u.to(device, non_blocking=True) for u in masks_pred]
+                return (x, masks_1, masks_2)
+            x, masks_enc, masks_pred = load_inputs()
+            maskA_meter.update(len(masks_enc[0][0]))
+            maskB_meter.update(len(masks_pred[0][0]))
+
+            def train_step():
+                _new_lr = scheduler.step()
+                _new_wd = wd_scheduler.step()
+                # --
+
+                def forward_target():
+                    """
+                    Returns list of tensors of shape [B, N, D], one for each
+                    mask-pred.
+                    """
+                    with torch.no_grad():
+                        h = target_encoder(x)
+                        h = F.layer_norm(h, (h.size(-1),))  # normalize over feature-dim
+                        B = len(h)
+                        # -- create targets (masked regions of h)
+                        h = apply_masks(h, masks_pred, concat=False)
+                        return h
+
+                def forward_context():
+                    """
+                    Returns list of tensors of shape [B, N, D], one for each
+                    mask-pred.
+                    """
+                    z = encoder(x, masks_enc)
+                    z = predictor(z, masks_enc, masks_pred)
+                    return z
+
+                def loss_fn(z, h):
+                    loss = 0.
+                    # Compute loss and accumulate for each mask-enc/mask-pred pair
+                    for zi, hi in zip(z, h):
+                        loss += torch.mean(torch.abs(zi - hi)**loss_exp) / loss_exp
+                    loss /= len(masks_pred)
+                    return loss
+                
+                def reg_fn(z):
+                    return sum([torch.sqrt(zi.var(dim=1) + 0.0001) for zi in z]) / len(z)
+                
+                def forward():
+                    loss_jepa, loss_reg = 0., 0.
+                    h = forward_target()
+                    z = forward_context()
+                    loss_jepa = loss_fn(z, h)
+                    pstd_z = reg_fn(z)  # predictor variance across patches
+                    loss_reg += torch.mean(F.relu(1.-pstd_z))
+                    loss = loss_jepa + reg_coeff * loss_reg
+                    return loss, loss_jepa, loss_reg                   
+
+                # Step 1. Forward
+                if torch.cuda.is_available():
+                    with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_bfloat16):
+                        loss, loss_jepa, loss_reg = forward()
+                else:
+                    loss, loss_jepa, loss_reg = forward()
+
+                #  Step 2. Backward & step
+                _enc_norm, _pred_norm = 0., 0.
+                if use_bfloat16:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                else:
+                    loss.backward()
+                
+                if (epoch > warmup) and (clip_grad is not None):
+                    _enc_norm = torch.nn.utils.clip_grad_norm_(encoder.parameters(), clip_grad)
+                    _pred_norm = torch.nn.utils.clip_grad_norm_(predictor.parameters(), clip_grad)
+                    
+                if use_bfloat16:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+
+                grad_stats = grad_logger(encoder.named_parameters())
+                grad_stats.global_norm = float(_enc_norm)
+                grad_stats_pred = grad_logger(predictor.named_parameters())
+                grad_stats_pred.global_norm = float(_pred_norm)
+                optimizer.zero_grad()
+                optim_stats = adamw_logger(optimizer)
+
+                # Step 3. momentum update of target encoder
+                with torch.no_grad():
+                    m = next(momentum_scheduler)
+                    for param_q, param_k in zip(encoder.parameters(), target_encoder.parameters()):
+                        param_k.data.mul_(m).add_((1.-m) * param_q.detach().data)
+
+                return (float(loss), float(loss_jepa), float(loss_reg), _new_lr, _new_wd, grad_stats, grad_stats_pred, optim_stats)
+            (loss, loss_jepa, loss_reg, _new_lr, _new_wd, grad_stats, grad_stats_pred, optim_stats), etime = gpu_timer(train_step)
+            loss_meter.update(loss)
+            loss_jepa_meter.update(loss_jepa)
+            loss_reg_meter.update(loss_reg)
+            time_meter.update(etime)
+
+            # -- Logging
+            def log_stats():
+                log_csv_wandb(epoch + 1, itr, loss, maskA_meter.val, maskB_meter.val, etime)
+
+                if (itr % log_freq == 0) or np.isnan(loss) or np.isinf(loss):
+                    logger.info('[%d, %5d] loss: %.3f loss_jepa: %.3f loss_reg: %.3f '
+                                'masks: %.1f %.1f '
+                                '[wd: %.2e] [lr: %.2e] '
+                                '[mem: %.2e] '
+                                '(%.1f ms)'
+                                % (epoch + 1, itr,
+                                   loss_meter.avg,
+                                   loss_jepa_meter.avg,
+                                   loss_reg_meter.avg,
+                                   maskA_meter.avg,
+                                   maskB_meter.avg,
+                                   _new_wd,
+                                   _new_lr,
+                                   torch.cuda.max_memory_allocated() / 1024.**2,
+                                   time_meter.avg))
+
+                    if optim_stats is not None:
+                        logger.info(
+                            '[%d, %5d] first moment: %.2e [%.2e %.2e] second moment: %.2e [%.2e %.2e]'
+                            % (epoch + 1, itr,
+                               optim_stats.get('exp_avg').avg,
+                               optim_stats.get('exp_avg').min,
+                               optim_stats.get('exp_avg').max,
+                               optim_stats.get('exp_avg_sq').avg,
+                               optim_stats.get('exp_avg_sq').min,
+                               optim_stats.get('exp_avg_sq').max))
+                        
+                    if grad_stats is not None:
+                        logger.info('[%d, %5d] enc_grad_stats: f/l[%.2e %.2e] mn/mx(%.2e, %.2e) %.2e'
+                                    % (epoch + 1, itr,
+                                       grad_stats.first_layer,
+                                       grad_stats.last_layer,
+                                       grad_stats.min,
+                                       grad_stats.max,
+                                       grad_stats.global_norm))
+
+                    if grad_stats_pred is not None:
+                        logger.info('[%d, %5d] pred_grad_stats: f/l[%.2e %.2e] mn/mx(%.2e, %.2e) %.2e'
+                                    % (epoch + 1, itr,
+                                       grad_stats_pred.first_layer,
+                                       grad_stats_pred.last_layer,
+                                       grad_stats_pred.min,
+                                       grad_stats_pred.max,
+                                       grad_stats_pred.global_norm))
+
+            log_stats()
+
+            assert not np.isnan(loss), 'loss is nan'
+
+        # -- Save Checkpoint after every epoch
+        logger.info('avg. loss %.3f' % loss_meter.avg)
+        save_checkpoint(epoch+1)
+
