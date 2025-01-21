@@ -25,23 +25,27 @@ MECLIP stands for Mutually exclusive CLIP. This methods is usable when we have b
 
 ```
 .
-├── configs                   # directory in which all experiment '.yaml' configs are stored
-├── src                       # the package
-│   ├── train.py              #   the I-JEPA training loop
-│   ├── helper.py             #   helper functions for init of models & opt/loading checkpoint
-│   ├── transforms.py         #   pre-train data transforms
-│   ├── datasets              #   datasets, data loaders, ...
-│   ├── models                #   model definitions
-│   ├── masks                 #   mask collators, masking utilities, ... (useful for jepa)
-│   └── utils                 #   shared utilities
+├── configs                           # directory in which all experiment '.yaml' configs are stored
+├── src                               # the package
+│   ├── helper.py                     #   helper functions for init of models & opt/loading checkpoint
+│   ├── transforms.py                 #   pre-train data transforms
+│   ├── datasets                      #   datasets, data loaders, ...
+│   ├── models                        #   model definitions
+│   ├── masks                         #   mask collators, masking utilities, ... (useful for jepa)
+│   └── utils                         #   shared utilities
 ├── ssls
-│   ├── byol                  #   train for byol
-│   ├── jepa                  #   train for jepa
-│   ├── simclr                #   simclr train and contrastive loss
-│   ├── meclip                #   meclip train and contrastive loss
-│   
-├── main_distributed.py       # entrypoint for launch distributed I-JEPA pretraining on SLURM cluster
-└── main.py                   # entrypoint for launch I-JEPA pretraining locally on your machine
+|   ├── main                          #   entry point for launch ECG-SSL pre-training locally on your machine
+│   ├── byol                          #   train for byol
+│   ├── jepa                          #   train for jepa
+│   ├── simclr                        #   simclr train and contrastive loss
+│   └── meclip                        #   meclip train and contrastive loss
+├── evals
+|   ├── main                          #   entry point for launch ECG-SSL fine-tuning locally on your machine
+│   ├── ecg_classification_frozen     #   train for ecg classification linear probing
+│   ├── ecg_classification            #   train for ecg classification finetuning
+│   └── ecg_translation               #   train for ecg to text finetuning
+├── main_distributed.py               # entrypoint for launch distributed I-JEPA pretraining on SLURM cluster
+└── main.py                           # entrypoint for launch ECG-SSL I-JEPA pretraining locally on your machine
 ```
 
 **Config files:**
