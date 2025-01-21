@@ -58,7 +58,6 @@ python main.py \
   --fname configs/in1k_vith14_ep300.yaml \
   --devices cuda:0 cuda:1 cuda:2
 ```
-*Note: This example is just used for illustrative purposes, as the ViT-H/14 config should be run on 16 A100 80G GPUs for an effective batch-size of 2048, in order to reproduce our results.*
 
 ## Launching ECG-SSL finetuning
 
@@ -69,7 +68,6 @@ python main.py \
   --fname configs/in1k_vith14_ep300.yaml \
   --devices cuda:0 cuda:1 cuda:2
 ```
-*Note: This example is just used for illustrative purposes, as the ViT-H/14 config should be run on 16 A100 80G GPUs for an effective batch-size of 2048, in order to reproduce our results.*
 ---
 
 ### Requirements
