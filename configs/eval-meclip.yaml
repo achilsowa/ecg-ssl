@@ -1,0 +1,25 @@
+nodes: 8
+tasks_per_node: 8
+tag: ???
+eval_name: ??? # ecg_classification or ecg_classification_frozen
+resume_checkpoint: false
+data: ???
+optimization:
+  strategy: warmup-cosine
+  num_epochs: 20
+  batch_size: 16 #16 effective batch size of 256
+  weight_decay: 0.001
+  lr: 0.001
+  start_lr: 0.001
+  final_lr: 0.0
+  warmup: 0.
+  use_bfloat16: false
+  early_stop: true
+  early_stop_patience: 5
+  early_stop_mindelta: 0.001
+model:
+  model_name: ecgresnet_1d34
+  checkpoint_key: encoder
+  checkpoint: ???
+  classifier_name: cls_proj_dims=512
+  
